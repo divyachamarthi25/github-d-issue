@@ -1,0 +1,14 @@
+# GitHub AI PM — Python dependencies
+# These are the ONLY packages needed. All GitHub/Claude API calls
+# use Python's built-in urllib — no extra HTTP library required.
+
+# No external packages needed!
+# All scripts use Python stdlib only:
+#   urllib.request  — HTTP calls to GitHub API and Claude API
+#   json            — JSON parsing
+#   os              — Environment variables
+#   datetime        — Date calculations
+#   sys             — Script routing
+
+# This file exists so GitHub Actions can cache dependencies.
+# If you add any pip packages, list them here.

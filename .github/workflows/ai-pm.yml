@@ -1,0 +1,325 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  GitHub AI Project Manager — Workflow
+#  Triggers on issue events and scheduled runs.
+#  All AI output is posted as comments directly on GitHub issues.
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: AI Project Manager
+
+on:
+  # ── Real-time triggers ──────────────────────────────────────────────────────
+  issues:
+    types:
+      - opened          # Summarise every new issue automatically
+      - labeled         # Trigger specific actions based on label applied
+
+  issue_comment:
+    types:
+      - created         # Respond to /ai slash commands in comments
+
+  # ── Scheduled runs ──────────────────────────────────────────────────────────
+  schedule:
+    - cron: "0 8 * * 1"   # Monday 08:00 UTC — weekly triage + executive report
+    - cron: "0 8 * * *"   # Daily   08:00 UTC — stale issue alerts
+
+  # ── Manual trigger (for demos) ──────────────────────────────────────────────
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to run manually"
+        required: true
+        default: "triage"
+        type: choice
+        options:
+          - triage
+          - executive_report
+          - migration_status
+          - stale_check
+
+permissions:
+  issues: write        # Post comments, add/remove labels
+  contents: read       # Read repo contents
+
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Auto-summarise every newly opened issue
+  # ────────────────────────────────────────────────────────────────────────────
+  summarise-new-issue:
+    name: "🤖 Summarise new issue"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues' && github.event.action == 'opened'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/scripts/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r .github/scripts/requirements.txt
+
+      - name: Generate AI summary
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER:      ${{ github.event.issue.number }}
+          ISSUE_TITLE:       ${{ github.event.issue.title }}
+          ISSUE_BODY:        ${{ github.event.issue.body }}
+          ISSUE_AUTHOR:      ${{ github.event.issue.user.login }}
+          REPO:              ${{ github.repository }}
+        run: python .github/scripts/ai_summary.py
+
+      - name: Apply ai-reviewed label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: context.issue.number,
+                labels: ['ai-reviewed']
+              });
+            } catch(e) {
+              // Label may not exist in this repo — that's fine
+              core.warning('Could not add label ai-reviewed: ' + e.message);
+            }
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Respond to /ai slash commands in issue comments
+  # ────────────────────────────────────────────────────────────────────────────
+  slash-commands:
+    name: "⚡ Handle /ai command"
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      startsWith(github.event.comment.body, '/ai')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/scripts/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r .github/scripts/requirements.txt
+
+      - name: Parse and dispatch command
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER:      ${{ github.event.issue.number }}
+          ISSUE_TITLE:       ${{ github.event.issue.title }}
+          ISSUE_BODY:        ${{ github.event.issue.body }}
+          ISSUE_AUTHOR:      ${{ github.event.issue.user.login }}
+          COMMENT_BODY:      ${{ github.event.comment.body }}
+          COMMENT_AUTHOR:    ${{ github.event.comment.user.login }}
+          REPO:              ${{ github.repository }}
+        run: |
+          python - <<'PYEOF'
+          import os, subprocess, sys
+
+          cmd = os.environ.get("COMMENT_BODY", "").strip().lower()
+
+          # Route to the right script
+          if cmd.startswith("/ai summary"):
+              subprocess.run([sys.executable, ".github/scripts/ai_summary.py"], check=True)
+
+          elif cmd.startswith("/ai template"):
+              subprocess.run([sys.executable, ".github/scripts/ai_template.py"], check=True)
+
+          elif cmd.startswith("/ai triage"):
+              subprocess.run([sys.executable, ".github/scripts/ai_triage.py"], check=True)
+
+          elif cmd.startswith("/ai migration"):
+              subprocess.run([sys.executable, ".github/scripts/ai_migration.py"], check=True)
+
+          elif cmd.startswith("/ai report"):
+              subprocess.run([sys.executable, ".github/scripts/ai_executive.py"], check=True)
+
+          elif cmd.startswith("/ai help"):
+              # Post help message directly
+              import urllib.request, json
+              token = os.environ["GITHUB_TOKEN"]
+              repo  = os.environ["REPO"]
+              issue = os.environ["ISSUE_NUMBER"]
+              body  = """## 🤖 GitHub AI PM — Available Commands
+
+| Command | What it does |
+|---|---|
+| `/ai summary` | AI summary of this issue (status, blockers, next actions, ETA) |
+| `/ai template` | Generate a structured update template for this issue |
+| `/ai triage` | Bulk triage all open issues in this repo |
+| `/ai migration` | Migration programme status dashboard |
+| `/ai report` | Full executive programme health report |
+| `/ai help` | Show this help message |
+
+> Powered by Claude · Runs as a GitHub Action · Results post as comments on this issue"""
+              payload = json.dumps({"body": body}).encode()
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/issues/{issue}/comments",
+                  data=payload,
+                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                  method="POST"
+              )
+              urllib.request.urlopen(req)
+
+          else:
+              print(f"Unknown command: {cmd!r}. Try /ai help")
+          PYEOF
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 3: Label-triggered actions
+  # ────────────────────────────────────────────────────────────────────────────
+  label-triggered:
+    name: "🏷️ Label-triggered AI action"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues' && github.event.action == 'labeled'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/scripts/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r .github/scripts/requirements.txt
+
+      - name: Run action based on label
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER:      ${{ github.event.issue.number }}
+          ISSUE_TITLE:       ${{ github.event.issue.title }}
+          ISSUE_BODY:        ${{ github.event.issue.body }}
+          ISSUE_AUTHOR:      ${{ github.event.issue.user.login }}
+          LABEL_APPLIED:     ${{ github.event.label.name }}
+          REPO:              ${{ github.repository }}
+        run: |
+          python - <<'PYEOF'
+          import os, subprocess, sys
+
+          label = os.environ.get("LABEL_APPLIED", "").lower()
+
+          if label in ("needs-summary", "ai-summarise", "ai-summarize"):
+              subprocess.run([sys.executable, ".github/scripts/ai_summary.py"], check=True)
+
+          elif label in ("needs-template", "needs-update"):
+              subprocess.run([sys.executable, ".github/scripts/ai_template.py"], check=True)
+
+          elif label in ("migration", "cloud-migration", "legacy"):
+              # Auto-run migration analysis when migration label applied
+              subprocess.run([sys.executable, ".github/scripts/ai_migration.py"], check=True)
+
+          else:
+              print(f"Label '{label}' has no AI action configured. Skipping.")
+          PYEOF
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 4: Scheduled — Weekly triage + executive report (Mondays)
+  # ────────────────────────────────────────────────────────────────────────────
+  weekly-report:
+    name: "📊 Weekly triage & executive report"
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 8 * * 1') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.action == 'triage' || github.event.inputs.action == 'executive_report'))
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/scripts/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r .github/scripts/requirements.txt
+
+      - name: Run AI triage
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          REPO:              ${{ github.repository }}
+          POST_AS_ISSUE:     "true"    # Creates a new issue with the triage report
+        run: python .github/scripts/ai_triage.py
+
+      - name: Run executive report
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          REPO:              ${{ github.repository }}
+          POST_AS_ISSUE:     "true"
+        run: python .github/scripts/ai_executive.py
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 5: Scheduled — Daily stale issue check
+  # ────────────────────────────────────────────────────────────────────────────
+  daily-stale-check:
+    name: "⚠️ Daily stale issue check"
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 8 * * *') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'stale_check')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/scripts/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r .github/scripts/requirements.txt
+
+      - name: Check for stale and unassigned issues
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          REPO:              ${{ github.repository }}
+          STALE_DAYS:        "3"
+          POST_AS_ISSUE:     "true"
+        run: python .github/scripts/ai_stale.py
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 6: Manual — Migration status
+  # ────────────────────────────────────────────────────────────────────────────
+  migration-status:
+    name: "☁️ Migration status report"
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'migration_status'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/scripts/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r .github/scripts/requirements.txt
+
+      - name: Run migration analysis
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          REPO:              ${{ github.repository }}
+          POST_AS_ISSUE:     "true"
+        run: python .github/scripts/ai_migration.py
